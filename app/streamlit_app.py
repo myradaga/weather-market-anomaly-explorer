@@ -9,6 +9,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from datetime import datetime,timezone
+import duckdb
 import numpy as np, pandas as pd, plotly.graph_objects as go, streamlit as st
 from app.config import get_settings
 from app.db.database import initialize,connect
@@ -17,7 +18,20 @@ from app.features.kalshi_events import build_activity_events,candidate_market_ma
 from app.scoring.composite import composite as combine_evidence
 
 st.set_page_config(page_title="Weather Market Anomaly Explorer",page_icon="🌦️",layout="wide")
-initialize(); s=get_settings()
+s=get_settings()
+try:
+    # Schema creation is only necessary for a new database. Re-running it on
+    # every page interaction asks DuckDB for a write lock and can collide with
+    # the scheduled data refresh.
+    if not s.db_path.exists(): initialize()
+    else:
+        with connect(read_only=True) as con: con.execute("SELECT 1")
+except duckdb.IOException as exc:
+    if "Could not set lock" not in str(exc): raise
+    st.warning("Live data refresh in progress. The dashboard will reconnect automatically when the updated data is ready.")
+    st.caption("The existing database is protected while calculations are being rebuilt. No data has been lost.")
+    st.components.v1.html("<script>setTimeout(() => window.parent.location.reload(), 5000);</script>",height=0)
+    st.stop()
 st.markdown("""<style>
 :root {--navy:#0f172a;--navy-2:#17233d;--charcoal:#111827;--text:#1f2937;--muted:#5f6b7c;--blue:#2563eb;--blue-soft:#eaf1ff;--surface:#ffffff;--page:#f5f7fb;--line:#dbe2ea;--radius:10px;}
 .stApp,[data-testid="stAppViewContainer"] {background:var(--page);color:var(--text)}
@@ -89,7 +103,7 @@ st.caption("Anomaly scores identify unusual patterns. They are not probabilities
 page=st.sidebar.radio("Navigate",["Dashboard","Polymarket","Kalshi","Events","Health","Settings / Data"])
 
 def df(sql,params=None):
-    with connect() as con:return con.execute(sql,params or []).fetchdf()
+    with connect(read_only=True) as con:return con.execute(sql,params or []).fetchdf()
 
 def weather_sql(alias="m"):
     return f"coalesce({alias}.weather_type,'') <> ''"
