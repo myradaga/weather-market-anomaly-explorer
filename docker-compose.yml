@@ -1,0 +1,11 @@
+services:
+  polymarket-detector:
+    build: .
+    container_name: polymarket-detector
+    ports: ["8501:8501"]
+    volumes: ["./data:/app/data"]
+    environment:
+      DATA_DIR: /app/data
+      DB_PATH: /app/data/polymarket.duckdb
+      PYTHONUNBUFFERED: "1"
+
