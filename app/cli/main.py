@@ -26,6 +26,11 @@ def score(): print(f"alerts created: {do_score()}")
 def ingest_kalshi_weather(markets:int=typer.Option(100,"--markets")):
     from app.pipeline.kalshi import ingest_kalshi_weather as run
     print(json.dumps(run(max_markets=markets),indent=2))
+@app.command("ingest-weather-context")
+def ingest_weather_context(articles:int=typer.Option(100,"--articles")):
+    """Collect official NWS alerts and lower-weight weather news context."""
+    from app.pipeline.weather_news import ingest_weather_context as run
+    print(json.dumps(run(max_articles=articles),indent=2))
 @app.command("run-all")
 def run_all(markets:int=typer.Option(25,"--markets")): print(json.dumps(do_run_all(markets),indent=2))
 @app.command()

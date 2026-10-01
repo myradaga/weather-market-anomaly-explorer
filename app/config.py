@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     data_api_base_url: str = "https://data-api.polymarket.com"
     clob_base_url: str = "https://clob.polymarket.com"
     kalshi_base_url: str = "https://external-api.kalshi.com/trade-api/v2"
+    nws_base_url: str = "https://api.weather.gov"
+    gdelt_base_url: str = "https://api.gdeltproject.org/api/v2/doc"
     request_timeout_seconds: float = 30
     max_retries: int = 5
     concurrency: int = 4

@@ -17,7 +17,11 @@ WEATHER_TERMS = re.compile(
     re.I,
 )
 
-FALSE_POSITIVES = re.compile(r"\b(miami heat|oklahoma city thunder|carolina hurricanes?|snow crabs?)\b", re.I)
+FALSE_POSITIVES = re.compile(
+    r"\b(miami heat|oklahoma city thunder|carolina hurricanes?|snow crabs?|"
+    r"offshore wind|wind (?:lease|farm|energy|power|turbine)s?)\b",
+    re.I,
+)
 
 TYPE_PATTERNS = (
     ("Temperature", re.compile(r"\btemp\b|temperature|hottest|coldest|\bdaily high\b|\bovernight low\b|degrees?|°\s*[fc]|fahrenheit|celsius|heat index|\b(?:hdd|cdd)\b|degree days?", re.I)),
@@ -47,6 +51,21 @@ def classify_weather(*objects):
     for label,pattern in TYPE_PATTERNS:
         if pattern.search(text): return label
     return "Other weather"
+
+DAILY_TERMS = re.compile(
+    r"\b(today|tomorrow|daily|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|"
+    r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|"
+    r"sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}\b",
+    re.I,
+)
+
+def classify_daily_rain_temperature(*objects):
+    """Return only explicitly day-specific temperature or rain contracts."""
+    text=metadata_text(*objects)
+    weather_type=classify_weather(*objects)
+    if weather_type not in {"Temperature","Rain & precipitation"} or not DAILY_TERMS.search(text):
+        return None
+    return weather_type
 
 def official_weather_source(weather_type):
     if weather_type in {"Tropical weather","Severe storms"}:

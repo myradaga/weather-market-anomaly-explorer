@@ -81,6 +81,14 @@ No cloud account, paid service, API credential, or production infrastructure is 
 
 `init`, `ingest --markets N`, `ingest --markets N --active`, `build`, `score`, `run-all --markets N`, `backtest`, `health`, and `export --format parquet` are available through `python -m app.cli.main`.
 
+Weather timing context can be refreshed with:
+
+```bash
+python -m app.cli.main ingest-weather-context --articles 100
+```
+
+This collects official National Weather Service alerts and lower-weight weather-news context indexed by GDELT. NWS items are treated as primary public timing evidence. News articles are supporting context only and never create an anomaly flag by themselves.
+
 Exports include `episodes.parquet`, `features.parquet`, `alerts.csv`, `alerts.parquet`, `public_events.csv`, and `reviews.csv` under `data/exports`.
 
 ## Research safeguards

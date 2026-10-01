@@ -6,7 +6,7 @@ from app.config import get_settings
 from app.db.database import initialize,connect
 from app.normalize.markets import token_ids
 from app.normalize.fills import signed_yes_exposure, stable_fill_id
-from app.weather import classify_weather, official_weather_source
+from app.weather import classify_daily_rain_temperature, classify_weather, official_weather_source
 log=logging.getLogger(__name__)
 CATEGORY_TAGS={
     "Politics":{"politics","elections","trump","congress","government"},
@@ -69,7 +69,7 @@ def ingest(limit=25, closed=True, weather_only=False):
     if weather_only:
         # The event/tag is only a discovery route. Each visible contract question
         # must independently contain meteorological language.
-        events=[dict(ev,markets=[m for m in (ev.get("markets") or []) if classify_weather(m.get("question"))]) for ev in events]
+        events=[dict(ev,markets=[m for m in (ev.get("markets") or []) if classify_daily_rain_temperature(m.get("question"))]) for ev in events]
         events=[ev for ev in events if ev.get("markets")]
     selected=[]
     if weather_only:
@@ -85,12 +85,12 @@ def ingest(limit=25, closed=True, weather_only=False):
             con.execute("DELETE FROM market_discovery_audit WHERE source='polymarket' AND discovered_at < ?",[now.replace(hour=0,minute=0,second=0,microsecond=0)])
             for ev in discovered_events:
                 for candidate in ev.get("markets") or []:
-                    wtype=classify_weather(candidate.get("question")); external=str(candidate.get("id") or candidate.get("conditionId") or "")
+                    wtype=classify_daily_rain_temperature(candidate.get("question")); external=str(candidate.get("id") or candidate.get("conditionId") or "")
                     audit_id=hashlib.sha256(f"polymarket|{external}|{now.date()}".encode()).hexdigest()
                     con.execute("INSERT OR REPLACE INTO market_discovery_audit VALUES (?,?,?,?,?,?,?,?)",[audit_id,"polymarket",now,external,candidate.get("question"),"ACCEPTED" if wtype else "REJECTED","Visible question match" if wtype else "No meteorological terms in visible question",wtype])
         for ev,market,category in selected:
                 if weather_only: category="Weather"
-                weather_type=classify_weather(market.get("question")) if weather_only else None
+                weather_type=classify_daily_rain_temperature(market.get("question")) if weather_only else None
                 yes,no=token_ids(market)
                 if not (yes and no): continue
                 mid=str(market.get("id")); cond=str(market.get("conditionId") or market.get("condition_id") or "")

@@ -6,7 +6,7 @@ from app.clients.kalshi import KalshiClient
 from app.db.database import initialize, connect
 from app.features.behavior import anomaly_percentiles
 from app.scoring.composite import composite
-from app.weather import classify_weather, official_weather_source
+from app.weather import classify_daily_rain_temperature, classify_weather, official_weather_source
 
 WEATHER_WORDS=("temperature","hottest","coldest","rain","rainfall","snow","snowfall","hurricane","tornado","storm","wind speed","precipitation","heat wave","freeze","frost")
 WEATHER_PATTERN=re.compile(r"\b(?:temperature|hottest|coldest|rain|rainfall|snow|snowfall|hurricane|hurricanes|tornado|tornadoes|storm|storms|wind speed|precipitation|heat wave|freeze|frost)\b",re.I)
@@ -107,7 +107,7 @@ def ingest_kalshi_weather(max_series=None,max_markets=1000):
             for market in (result.get("markets",[]) if isinstance(result,dict) else []):
                 # A weather-like series is only a discovery route. The individual
                 # contract must independently contain explicit meteorological terms.
-                wtype=classify_weather(market)
+                wtype=classify_daily_rain_temperature(market)
                 audit_id=__import__('hashlib').sha256(f"kalshi|{market.get('ticker')}|{now.date()}".encode()).hexdigest()
                 con.execute("INSERT OR REPLACE INTO market_discovery_audit VALUES (?,?,?,?,?,?,?,?)",[audit_id,"kalshi",now,str(market.get("ticker") or ""),market.get("title"),"ACCEPTED" if wtype else "REJECTED","Weather series and contract metadata match" if wtype else "No meteorological contract metadata match",wtype])
                 if not wtype: continue

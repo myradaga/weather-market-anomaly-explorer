@@ -19,6 +19,7 @@ def test_weather_classification_uses_event_metadata_and_avoids_team_names():
     assert classify_weather({"title":"Daily high temperature in New York"},{"question":"Will it be above 90°F?"})=="Temperature"
     assert classify_weather({"category":"Climate and Weather"},{"title":"Seattle rainfall bracket"})=="Rain & precipitation"
     assert classify_weather({"title":"Miami Heat vs Boston Celtics"}) is None
+    assert classify_weather({"title":"Will a federal offshore wind lease be terminated?"}) is None
     assert classify_weather({"title":"Will the minimum WTI price reach $60?"}) is None
     assert classify_weather({"title":"Will Brazil annual inflation be above 5%?"}) is None
     assert classify_weather({"title":"Will a ski resort open before December?"}) is None

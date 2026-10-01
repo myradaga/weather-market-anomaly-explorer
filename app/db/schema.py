@@ -15,4 +15,5 @@ CREATE TABLE IF NOT EXISTS kalshi_weather_markets(ticker VARCHAR PRIMARY KEY, ev
 CREATE TABLE IF NOT EXISTS kalshi_weather_trades(trade_id VARCHAR PRIMARY KEY, ticker VARCHAR, timestamp_utc TIMESTAMP, outcome_side VARCHAR, book_side VARCHAR, price DOUBLE, contracts DOUBLE, notional DOUBLE, size_percentile DOUBLE, robust_z DOUBLE, anomaly_score DOUBLE, is_anomaly BOOLEAN, is_block_trade BOOLEAN, k1_size DOUBLE, k2_price DOUBLE, k3_burst DOUBLE, k4_concentration DOUBLE, k5_behavior DOUBLE);
 CREATE TABLE IF NOT EXISTS market_discovery_audit(audit_id VARCHAR PRIMARY KEY, source VARCHAR, discovered_at TIMESTAMP, external_id VARCHAR, title VARCHAR, decision VARCHAR, reason VARCHAR, weather_type VARCHAR);
 CREATE TABLE IF NOT EXISTS authoritative_weather_sources(source_key VARCHAR PRIMARY KEY, name VARCHAR, url VARCHAR, purpose VARCHAR, updated_at TIMESTAMP);
+CREATE TABLE IF NOT EXISTS weather_news_items(item_id VARCHAR PRIMARY KEY, source_name VARCHAR, source_type VARCHAR, title VARCHAR, url VARCHAR, published_at TIMESTAMP, retrieved_at TIMESTAMP, source_domain VARCHAR, weather_type VARCHAR, location_text VARCHAR, reliability DOUBLE, raw_snapshot_id VARCHAR);
 """

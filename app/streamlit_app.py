@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -11,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from datetime import datetime,timezone
 import duckdb
 import numpy as np, pandas as pd, plotly.graph_objects as go, streamlit as st
+from plotly.subplots import make_subplots
 from app.config import get_settings
 from app.db.database import initialize,connect
 from app.events.manual import save_event
@@ -100,13 +102,18 @@ hr {border-color:var(--line)}
 </style>""",unsafe_allow_html=True)
 st.markdown("""<div class="hero"><h1>Weather Market Anomaly Explorer</h1><p>Compare live Polymarket wallet episodes with public Kalshi weather-market trade anomalies.</p></div>""",unsafe_allow_html=True)
 st.caption("Anomaly scores identify unusual patterns. They are not probabilities of illegal conduct and do not establish wrongdoing.")
-page=st.sidebar.radio("Navigate",["Dashboard","Polymarket","Kalshi","Events","Health","Settings / Data"])
+page=st.sidebar.radio("Navigate",["Dashboard","Polymarket Scanner","Kalshi Scanner","Events","Health","Settings / Data"])
 
 def df(sql,params=None):
     with connect(read_only=True) as con:return con.execute(sql,params or []).fetchdf()
 
 def weather_sql(alias="m"):
-    return f"coalesce({alias}.weather_type,'') <> ''"
+    daily=r"(today|tomorrow|daily|monday|tuesday|wednesday|thursday|friday|saturday|sunday|jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|jun(e)?|jul(y)?|aug(ust)?|sep(tember)?|oct(ober)?|nov(ember)?|dec(ember)?)[[:space:]]*[0-9]{0,2}"
+    return f"coalesce({alias}.weather_type,'') IN ('Temperature','Rain & precipitation') AND regexp_matches(lower(coalesce({alias}.question,'')), '{daily}')"
+
+def kalshi_daily_sql(alias="m"):
+    daily=r"(today|tomorrow|daily|monday|tuesday|wednesday|thursday|friday|saturday|sunday|jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|jun(e)?|jul(y)?|aug(ust)?|sep(tember)?|oct(ober)?|nov(ember)?|dec(ember)?)[[:space:]]*[0-9]{0,2}"
+    return f"coalesce({alias}.weather_type,'') IN ('Temperature','Rain & precipitation') AND regexp_matches(lower(coalesce({alias}.title,'') || ' ' || coalesce({alias}.subtitle,'')), '{daily}')"
 
 def chart_theme(fig):
     black="#000000"
@@ -139,14 +146,83 @@ def episode_reasons(row):
         if pd.notna(value): ranked.append((float(value),label))
     return [f"{label} ({value:.2f})" for value,label in sorted(ranked,reverse=True)[:3]]
 
+def daily_weather_filter(frame,selection,title_columns):
+    """Keep the scanner centered on daily temperature and rain contracts."""
+    if frame.empty:return frame
+    text=frame[title_columns].fillna("").astype(str).agg(" ".join,axis=1)
+    daily=text.str.contains(r"today|tomorrow|daily|monday|tuesday|wednesday|thursday|friday|saturday|sunday|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s*\d{0,2}",case=False,regex=True)
+    temperature=frame.weather_type.eq("Temperature")&text.str.contains(r"temperature|daily high|overnight low|degrees?|fahrenheit|celsius",case=False,regex=True)&daily
+    rain=frame.weather_type.eq("Rain & precipitation")&text.str.contains(r"rain|rainfall|precipitation",case=False,regex=True)&daily
+    wanted=pd.Series(False,index=frame.index)
+    if "Daily temperature" in selection:wanted|=temperature
+    if "Daily rain" in selection:wanted|=rain
+    return frame[wanted]
+
+def scanner_checklist(unit):
+    if unit=="wallet":
+        return ["Wallet share: is it close to 90% or more of observed market trading?","Position: YES or NO, dollar value, entry price, and number of fills.","Trade time: did activity cluster near a verified weather update or market close?","Flag reason: which signals were high, and were those signals reliable?","Follow-up: did the price continue, reverse, or show no later evidence?"]
+    return ["Trade size: is the event large in dollars and compared with similar Kalshi trades?","Position: which outcome side was traded, at what price, and for how many contracts?","Trade time: was there a burst near a weather update or contract close?","Flag reason: which K1–K5 signals crossed the rule and how reliable were they?","Follow-up: did the executed price continue, reverse, or return to its earlier level?"]
+
+def show_scanner_checklist(unit):
+    label="wallet episode" if unit=="wallet" else "trade event"
+    with st.expander(f"What to check in each {label}",expanded=True):
+        for item in scanner_checklist(unit):st.write(f"• {item}")
+
+NEWS_STOP={"will","weather","market","daily","temperature","rain","rainfall","precipitation","high","low","above","below","more","than","the","and","for","with","from","this","that","what"}
+def weather_context_for(text,reference_time=None,limit=6):
+    """Cautiously match official alerts and news using shared specific words."""
+    try:items=df("SELECT * FROM weather_news_items WHERE published_at >= current_timestamp - INTERVAL 14 DAY ORDER BY published_at DESC")
+    except duckdb.CatalogException:return pd.DataFrame()
+    if items.empty:return items
+    target={x for x in re.findall(r"[a-z0-9]+",str(text).lower()) if len(x)>2 and x not in NEWS_STOP}
+    def similarity(row):
+        words={x for x in re.findall(r"[a-z0-9]+",f"{row.title} {row.location_text}".lower()) if len(x)>2 and x not in NEWS_STOP}
+        shared=target&words
+        return len(shared)/max(1,len(target)),", ".join(sorted(shared))
+    scores=items.apply(similarity,axis=1,result_type="expand"); items["Match score"]=scores[0]; items["Shared details"]=scores[1]
+    if reference_time is not None:
+        reference=pd.to_datetime(reference_time,utc=True); published=pd.to_datetime(items.published_at,utc=True)
+        items["Hours from trade"]=(published-reference).dt.total_seconds()/3600
+        items=items[items["Hours from trade"].abs()<=168]
+    items=items[(items["Match score"]>=.12)|(items.source_type=="OFFICIAL_ALERT")]
+    return items.sort_values(["reliability","Match score","published_at"],ascending=[False,False,False]).head(limit)
+
+def show_weather_context(text,reference_time,widget_key):
+    st.subheader("Weather information published near the trade")
+    st.caption("Official NWS alerts are primary timing evidence. News articles are lower-weight context and do not create a flag by themselves.")
+    context=weather_context_for(text,reference_time)
+    if context.empty:
+        st.info("No sufficiently similar official alert or news item was found in the current feed.")
+        return
+    display=context.rename(columns={"source_name":"Source","source_type":"Evidence type","title":"Headline","published_at":"Published","reliability":"Timing reliability","url":"Link"})
+    cols=["Evidence type","Source","Headline","Published","Hours from trade","Timing reliability","Shared details","Link"]
+    st.dataframe(display[cols],width="stretch",hide_index=True,column_config={"Link":st.column_config.LinkColumn(),"Timing reliability":st.column_config.NumberColumn(format="%.2f"),"Hours from trade":st.column_config.NumberColumn(format="%.1f")})
+    st.warning("Check the original source time before treating an item as timing evidence. A later news story may summarize information that was already public earlier.")
+
 def score_description(score):
     if score>=.92:return "Very unusual"
     if score>=.85:return "Highly unusual"
     if score>=.75:return "Worth monitoring"
     return "Below alert threshold"
 
+def influence_description(share):
+    """Describe dominance of observed public trading without claiming ownership."""
+    if share is None or pd.isna(share):return "Not measurable", "The public data is insufficient to estimate influence."
+    share=float(share)
+    if share>=.90:return "Dominant observed flow", "This wallet or event supplied at least 90% of the observed traded value. Check liquidity before treating that as meaningful."
+    if share>=.50:return "Major observed influence", "It supplied more than half of the observed traded value and may have strongly affected the displayed market activity."
+    if share>=.25:return "Significant observed influence", "It supplied at least one quarter of observed traded value, but did not dominate the market."
+    return "Limited observed influence", "It was unusual for other reasons, but its share of observed traded value was below 25%."
+
+def readable_subplots(fig,title):
+    fig.update_layout(title=title,paper_bgcolor="#ffffff",plot_bgcolor="#ffffff",font=dict(color="#000000"),title_font=dict(color="#000000",size=17),legend=dict(font=dict(color="#000000"),orientation="h",y=1.09),hoverlabel=dict(bgcolor="#ffffff",font=dict(color="#000000")),hovermode="x unified",margin=dict(l=55,r=25,t=90,b=50),height=620)
+    fig.update_xaxes(tickfont=dict(color="#000000"),title_font=dict(color="#000000"),gridcolor="#e5e7eb",linecolor="#94a3b8")
+    fig.update_yaxes(tickfont=dict(color="#000000"),title_font=dict(color="#000000"),gridcolor="#e5e7eb",linecolor="#94a3b8")
+    return fig
+
 def render_polymarket_analysis():
     st.markdown("---"); st.subheader("Polymarket anomaly graph and calculations")
+    show_scanner_checklist("wallet")
     st.caption("Strict queue rule: score ≥ 0.75, at least four valid modules, at least two signals ≥ 0.75, and either 2+ trades with $100+ notional or one exceptionally large $5,000+ trade.")
     choices=df(f"""SELECT a.alert_id,a.composite_score,m.question,e.wallet FROM alerts a JOIN episodes e USING(episode_id) JOIN markets m USING(market_id)
         WHERE {weather_sql()} AND m.status='open' ORDER BY a.composite_score DESC""")
@@ -155,18 +231,55 @@ def render_polymarket_analysis():
     aid=st.selectbox("Choose a flagged Polymarket wallet episode",choices.alert_id.tolist(),format_func=labels.get,key="poly_case")
     case=df("""SELECT a.*,e.*,m.question,m.slug,m.resolved_token,m.resolution_time,f.* FROM alerts a JOIN episodes e USING(episode_id)
         JOIN markets m USING(market_id) JOIN episode_features f USING(episode_id) WHERE alert_id=?""",[aid]).iloc[0]
-    p1,p2,p3,p4=st.columns(4); p1.metric("Anomaly score",f"{case.composite_score:.3f}"); p2.metric("Direction",case.direction); p3.metric("Episode notional",f"${case.total_notional:,.2f}"); p4.metric("Trades",int(case.trade_count))
+    p1,p2,p3,p4=st.columns(4); p1.metric("Anomaly score",f"{case.composite_score:.3f}"); p2.metric("Position",case.direction); p3.metric("Position value",f"${case.total_notional:,.2f}"); p4.metric("Trades",int(case.trade_count))
     st.markdown(f"**{case.question}**  \nWallet: `{case.wallet}`")
     reasons=episode_reasons(case); st.info("**Why flagged:** "+("; ".join(reasons) if reasons else "No strong explanation available."))
-    fills=df("""SELECT timestamp_utc,price,side,outcome,size,notional FROM fills WHERE market_id=? AND wallet=?
+    share=float(case.market_volume_share) if pd.notna(case.market_volume_share) else None
+    directional=float(case.wallet_directional_share) if pd.notna(case.wallet_directional_share) else None
+    influence_label,influence_explanation=influence_description(share)
+    s1,s2,s3=st.columns(3)
+    s1.metric("Share of observed traded value",f"{share:.1%}" if share is not None else "Unavailable",influence_label)
+    s2.metric("Directional share",f"{directional:.1%}" if directional is not None else "Unavailable")
+    s3.metric("First trade time",str(case.entry_time))
+    st.info(f"**Market-influence reading: {influence_label}.** {influence_explanation} This is a share of captured public trades—not proof that the wallet owns or controls the market.")
+    fills=df("""SELECT timestamp_utc,price,side,outcome,size,notional,signed_exposure FROM fills WHERE market_id=? AND wallet=?
         AND timestamp_utc BETWEEN ? AND ? ORDER BY timestamp_utc""",[case.market_id,case.wallet,case.entry_time,case.exit_time])
     fills["cumulative_notional"]=fills.notional.cumsum()
-    fig=go.Figure(); fig.add_trace(go.Bar(x=fills.timestamp_utc,y=fills.notional,name="Individual trade ($)",marker_color=["#2563eb" if x=="BUY" else "#dc2626" for x in fills.side],customdata=fills[["price","size","side","outcome"]],hovertemplate="%{x}<br>$%{y:,.2f}<br>$%{customdata[0]:.4f} × %{customdata[1]:,.2f}<br>%{customdata[2]} %{customdata[3]}<extra></extra>")); fig.add_trace(go.Scatter(x=fills.timestamp_utc,y=fills.cumulative_notional,yaxis="y2",name="Cumulative ($)",line=dict(color="#111827",width=3)))
-    fig.update_layout(title="Polymarket episode trade progression",xaxis_title="Time",yaxis_title="Trade value ($)",yaxis2=dict(title="Cumulative value ($)",overlaying="y",side="right"),paper_bgcolor="#fff",plot_bgcolor="#fff",font=dict(color="#000"),hovermode="x unified")
-    st.plotly_chart(chart_theme(fig),width="stretch")
+    market_prices=df("SELECT timestamp_utc,price FROM fills WHERE market_id=? ORDER BY timestamp_utc",[case.market_id])
+    totals=df("""SELECT count(*) market_fills,sum(notional) market_value,
+        sum(CASE WHEN wallet=? THEN 1 ELSE 0 END) wallet_fills,
+        sum(CASE WHEN wallet=? THEN notional ELSE 0 END) wallet_value
+        FROM fills WHERE market_id=?""",[case.wallet,case.wallet,case.market_id]).iloc[0]
+    net_exposure=float(fills.signed_exposure.fillna(0).sum())
+    observed_share=float(totals.wallet_value/totals.market_value) if totals.market_value else share
+    positions=df("""WITH wallet_positions AS (
+        SELECT wallet,sum(signed_exposure) net_position FROM fills WHERE market_id=? GROUP BY wallet)
+        SELECT wallet,net_position,
+          sum(CASE WHEN net_position>0 THEN net_position ELSE 0 END) OVER () total_yes,
+          sum(CASE WHEN net_position<0 THEN -net_position ELSE 0 END) OVER () total_no
+        FROM wallet_positions""",[case.market_id])
+    wallet_position=positions[positions.wallet==case.wallet]
+    if len(wallet_position):
+        wp=wallet_position.iloc[0]; position_side="YES" if wp.net_position>=0 else "NO"; position_amount=abs(float(wp.net_position)); side_total=float(wp.total_yes if position_side=="YES" else wp.total_no); ownership_estimate=position_amount/side_total if side_total else None
+    else:position_side=case.direction; position_amount=0.0; ownership_estimate=None
+    ownership_text=f"{ownership_estimate:.1%} of captured {position_side} exposure" if ownership_estimate is not None else "Unavailable"
+    control_rows=pd.DataFrame({"Question":["What percentage of the captured position does it hold?","How much of the captured market did this wallet trade?","What position did it build?","How many captured fills belong to it?","Could it be controlling the market?"],"Evidence":[ownership_text,f"${totals.wallet_value:,.2f} of ${totals.market_value:,.2f} ({observed_share:.1%})",f"{position_side}; net captured exposure ${position_amount:,.2f}",f"{int(totals.wallet_fills):,} of {int(totals.market_fills):,} fills",influence_description(observed_share)[0]],"Interpretation":["Derived from each wallet's net buys and sells on the same side", "Share of captured public traded value—not ownership", "Estimated from the trades captured by this dashboard", "Shows frequency as well as dollars", influence_description(observed_share)[1]]})
+    st.subheader("Market influence and position"); st.dataframe(control_rows,width="stretch",hide_index=True)
+    if ownership_estimate is not None:
+        own_label,_=influence_description(ownership_estimate)
+        st.metric("Estimated captured position ownership",f"{ownership_estimate:.1%}",f"{own_label} · {position_side} side")
+    st.warning("This is a new derived estimate, not a verified blockchain balance. It can miss positions acquired before the captured trade window, transferred tokens, redemptions, and activity omitted by the public API. It should be described as ‘estimated share of captured position,’ not true legal ownership.")
+    st.markdown("**How to read the graph:** The top panel is price: 0.70 means about 70¢ per share. The gray line is all captured market trades; colored dots are this wallet's actual fills. The bottom panel shows the dollar value of each wallet trade—taller bars mean larger trades.")
+    fig=make_subplots(rows=2,cols=1,shared_xaxes=True,vertical_spacing=.12,row_heights=[.6,.4],subplot_titles=("Price paid over time (0–1)","This wallet's individual trade values"))
+    fig.add_trace(go.Scatter(x=market_prices.timestamp_utc,y=market_prices.price,name="All captured market prices",mode="lines",line=dict(color="#94a3b8",width=2),hovertemplate="Market price %{y:.3f}<extra></extra>"),row=1,col=1)
+    for outcome,color in [("YES","#2563eb"),("NO","#dc2626")]:
+        subset=fills[fills.outcome.astype(str).str.upper()==outcome]
+        if len(subset):fig.add_trace(go.Scatter(x=subset.timestamp_utc,y=subset.price,name=f"Wallet {outcome} fills",mode="markers",marker=dict(color=color,size=10,line=dict(color="#ffffff",width=1)),customdata=subset[["side","size","notional"]],hovertemplate=f"{outcome} · %{{customdata[0]}}<br>Price %{{y:.3f}}<br>%{{customdata[1]:,.2f}} shares · $%{{customdata[2]:,.2f}}<extra></extra>"),row=1,col=1)
+    fig.add_trace(go.Bar(x=fills.timestamp_utc,y=fills.notional,name="Wallet trade value",marker_color=["#2563eb" if str(x).upper()=="YES" else "#dc2626" for x in fills.outcome],customdata=fills[["price","size","side","outcome"]],hovertemplate="$%{y:,.2f}<br>Price %{customdata[0]:.3f} × %{customdata[1]:,.2f} shares<br>%{customdata[2]} %{customdata[3]}<extra></extra>"),row=2,col=1)
+    fig.update_yaxes(title_text="Price",range=[0,1],row=1,col=1); fig.update_yaxes(title_text="Trade value ($)",row=2,col=1); fig.update_xaxes(title_text="Trade time",row=2,col=1)
+    st.plotly_chart(readable_subplots(fig,"Wallet position, price, and trade progression"),width="stretch")
     log=fills.copy(); log["Notional calculation"]=log.apply(lambda r:f"${r.price:.4f} × {r.size:,.2f} = ${r.notional:,.2f}",axis=1)
     st.dataframe(log.rename(columns={"timestamp_utc":"Time","side":"Action","outcome":"Outcome","price":"Price","size":"Shares","notional":"Trade value ($)","cumulative_notional":"Cumulative ($)"})[["Time","Action","Outcome","Price","Shares","Trade value ($)","Notional calculation","Cumulative ($)"]],width="stretch",hide_index=True)
-    market_prices=df("SELECT timestamp_utc,price FROM fills WHERE market_id=? ORDER BY timestamp_utc",[case.market_id])
     performance=horizon_performance(market_prices,case.entry_time,case.entry_price,case.direction)
     if case.resolved and str(case.resolved_token).upper() in ("YES","NO"):
         settlement=1.0 if str(case.resolved_token).upper()==case.direction else 0.0
@@ -188,6 +301,7 @@ def render_polymarket_analysis():
     st.success(f"Case data completeness: {quality} · {len(fills)} graph trades · {active_modules}/5 active signals · {available_horizons}/{len(performance)} follow-up prices")
     event_rows=df("SELECT event_time_utc,headline,confidence,source_url FROM public_events WHERE market_id=? AND verified AND NOT rejected ORDER BY event_time_utc",[case.market_id])
     if len(event_rows): st.dataframe(event_rows.rename(columns={"event_time_utc":"Observation / event time","headline":"Timing reference","confidence":"Confidence","source_url":"Source"}),width="stretch",hide_index=True)
+    show_weather_context(case.question,case.entry_time,"poly_weather_context")
     if case.slug: st.link_button("Open original Polymarket market",f"https://polymarket.com/event/{case.slug}")
     if case.suppression_reasons: st.warning(f"Unavailable evidence: {case.suppression_reasons}")
 
@@ -211,7 +325,7 @@ if page=="Dashboard":
     st.caption("* Priority also requires all five reliable modules and high-confidence timing evidence.")
     live_counts=df(f"SELECT count(*) live_markets FROM markets m WHERE raw_snapshot_id='live' AND m.status='open' AND {weather_sql()}")
     live_fills=df(f"SELECT count(*) live_fills FROM fills f JOIN markets m USING(market_id) WHERE f.source_snapshot_id='live' AND m.status='open' AND {weather_sql()}")
-    kalshi_counts=df("SELECT (SELECT count(*) FROM kalshi_weather_markets WHERE status IN ('open','active')) markets,(SELECT count(*) FROM kalshi_weather_trades t JOIN kalshi_weather_markets m USING(ticker) WHERE m.status IN ('open','active')) trades")
+    kalshi_counts=df(f"SELECT (SELECT count(*) FROM kalshi_weather_markets m WHERE status IN ('open','active') AND {kalshi_daily_sql()}) markets,(SELECT count(*) FROM kalshi_weather_trades t JOIN kalshi_weather_markets m USING(ticker) WHERE m.status IN ('open','active') AND {kalshi_daily_sql()}) trades")
     if int(live_counts.iloc[0,0]): st.markdown("<div class='status-pill'><span class='status-dot'></span>Live weather data connected</div>",unsafe_allow_html=True)
     else: st.info("No live API records loaded yet. Run an active or resolved market ingestion.")
     weather_metrics=df(f"""SELECT
@@ -220,8 +334,8 @@ if page=="Dashboard":
       (SELECT count(DISTINCT wallet) FROM fills f JOIN markets m USING(market_id) WHERE m.status='open' AND {weather_sql()}) wallets,
       (SELECT count(*) FROM episodes e JOIN markets m USING(market_id) WHERE m.status='open' AND {weather_sql()}) episodes,
       (SELECT count(*) FROM alerts a JOIN episodes e USING(episode_id) JOIN markets m USING(market_id) WHERE m.status='open' AND {weather_sql()}) alerts,
-      (SELECT count(*) FROM kalshi_weather_markets WHERE status IN ('open','active')) kalshi_markets,
-      (SELECT count(*) FROM kalshi_weather_trades t JOIN kalshi_weather_markets m USING(ticker) WHERE t.is_anomaly AND m.status IN ('open','active')) kalshi_anomalies""").iloc[0]
+      (SELECT count(*) FROM kalshi_weather_markets m WHERE status IN ('open','active') AND {kalshi_daily_sql()}) kalshi_markets,
+      (SELECT count(*) FROM kalshi_weather_trades t JOIN kalshi_weather_markets m USING(ticker) WHERE t.is_anomaly AND m.status IN ('open','active') AND {kalshi_daily_sql()}) kalshi_anomalies""").iloc[0]
     st.markdown("### Polymarket overview")
     cols=st.columns(4)
     for c,(label,value) in zip(cols,[("Open markets",weather_metrics.polymarket_markets),("Public trades",weather_metrics.polymarket_trades),("Unique wallets",weather_metrics.wallets),("Flagged episodes",weather_metrics.alerts)]): c.metric(label,f"{int(value):,}")
@@ -250,25 +364,29 @@ if page=="Dashboard":
         CASE WHEN eligible THEN 'Included' ELSE 'Below liquidity gate' END AS Coverage
         FROM markets m WHERE raw_snapshot_id='live' AND m.status='open' AND {weather_sql()} ORDER BY volume DESC""")
     st.dataframe(live_markets,width="stretch",hide_index=True)
-elif page=="Polymarket":
-    st.subheader("Polymarket Weather Markets")
+elif page=="Polymarket Scanner":
+    st.subheader("Polymarket Daily Rain and Temperature Scanner")
     st.caption("A bet episode groups one wallet's trades in one market until a 24-hour inactivity gap. YES means exposure toward the market resolving Yes; NO means exposure toward No.")
+    show_scanner_checklist("wallet")
     with st.expander("Quick guide: what do these columns mean?"):
         st.write("**Episode notional** is the approximate dollar value traded during the episode. **Average entry price** is the average price paid on a 0–1 probability scale (0.35 ≈ 35%). **Direction persistence** near 1 means trading stayed strongly one-directional; near 0 means activity offset itself.")
     st.markdown("<div class='status-pill'><span class='status-dot'></span>Live Polymarket public API data</div>",unsafe_allow_html=True)
     source_clause="m.raw_snapshot_id='live'"
     st.info("Polymarket exposes pseudonymous wallets, so wallet episodes can be analyzed. Kalshi's public trade feed does not expose trader identities, so Kalshi analysis is trade-level only.")
+    focus=["Daily temperature","Daily rain"]
+    st.caption("Coverage is fixed to dated daily temperature and daily rain or precipitation markets.")
     c1,c2,c3,c4=st.columns(4)
     search=c1.text_input("Find a weather market",placeholder="temperature, rain, hurricane…")
     direction=c2.multiselect("Bet direction",["YES","NO"],default=["YES","NO"])
     min_notional=c3.number_input("Minimum episode notional ($)",min_value=0.0,value=0.0,step=100.0)
     c4.metric("Market status","OPEN / LIVE")
-    bets=df(f"""SELECT e.episode_id,m.question,m.category,e.direction,e.wallet,e.entry_time,e.exit_time,
+    bets=df(f"""SELECT e.episode_id,m.question,m.category,m.weather_type,e.direction,e.wallet,e.entry_time,e.exit_time,
         round(e.entry_price,3) entry_price,round(e.total_notional,2) total_notional,
-        e.trade_count,round(e.persistence,2) persistence,m.status,m.resolved_token,
+        e.trade_count,round(e.persistence,2) persistence,m.status,m.resolved_token,f.market_volume_share,f.wallet_directional_share,
         'LIVE API' data_source
-        FROM episodes e JOIN markets m USING(market_id)
+        FROM episodes e JOIN markets m USING(market_id) LEFT JOIN episode_features f USING(episode_id)
         WHERE {source_clause} AND m.status='open' AND {weather_sql()} AND e.total_notional>=? ORDER BY e.total_notional DESC""",[min_notional])
+    bets=daily_weather_filter(bets,focus,["question"])
     if search and len(bets): bets=bets[bets.question.str.contains(search,case=False,na=False)]
     if len(bets): bets=bets[bets.direction.isin(direction)]
     if bets.empty: st.info("No bet episodes match these filters.")
@@ -282,8 +400,9 @@ elif page=="Polymarket":
                 meta2.metric("Wallets",f"{group.wallet.nunique():,}")
                 meta3.metric("YES episodes",f"{yes_count:,}")
                 meta4.metric("NO episodes",f"{no_count:,}")
-                display=group.rename(columns={"direction":"Bet on","wallet":"Wallet","entry_time":"First trade","exit_time":"Last trade","entry_price":"Average entry price","total_notional":"Episode notional ($)","trade_count":"Trades","persistence":"Direction persistence","data_source":"Source"})
-                st.dataframe(display[["Bet on","Wallet","Episode notional ($)","Average entry price","Trades","First trade","Last trade","Direction persistence","Source"]].head(200),width="stretch",hide_index=True)
+                display=group.copy(); display["Wallet share of market"]=display.market_volume_share.map(lambda x:f"{x:.1%}" if pd.notna(x) else "Unavailable"); display["Priority ownership check"]=display.market_volume_share.map(lambda x:"CHECK — 90%+" if pd.notna(x) and x>=.90 else "Below 90%")
+                display=display.rename(columns={"direction":"Position","wallet":"Wallet","entry_time":"First trade time","exit_time":"Last trade time","entry_price":"Average entry price","total_notional":"Position value ($)","trade_count":"Trades","persistence":"Direction persistence","data_source":"Source"})
+                st.dataframe(display[["Position","Wallet","Wallet share of market","Priority ownership check","Position value ($)","Average entry price","Trades","First trade time","Last trade time","Source"]].head(200),width="stretch",hide_index=True)
     render_polymarket_analysis()
 elif page=="Polymarket Anomalies":
     st.subheader("Polymarket Weather Anomalies")
@@ -335,19 +454,24 @@ elif page=="Polymarket Anomalies":
                             if episode.suppression_reasons: st.caption(f"Missing or weakened evidence: {episode.suppression_reasons}")
                             if episode.data_quality_flags: st.warning(f"Data-quality flags: {episode.data_quality_flags}")
                             st.caption(f"Source: {episode.data_source} · Review status: {episode.review_status} · This is an anomaly ranking, not evidence of wrongdoing.")
-elif page=="Kalshi":
-    st.subheader("Kalshi Weather Markets")
+elif page=="Kalshi Scanner":
+    st.subheader("Kalshi Daily Rain and Temperature Scanner")
     st.caption("Kalshi provides no public trader identity. The Market Activity Review Score uses only observable trade and market evidence; it is not a user, wallet, or fraud score.")
-    kalshi_markets=df("SELECT ticker,title,subtitle,weather_type,'OPEN / LIVE' status,last_price,volume,open_interest,close_time FROM kalshi_weather_markets WHERE status IN ('open','active') ORDER BY volume DESC")
+    show_scanner_checklist("trade")
+    focus=["Daily temperature","Daily rain"]
+    st.caption("Coverage is fixed to dated daily temperature and daily rain or precipitation markets.")
+    kalshi_markets=df(f"SELECT ticker,title,subtitle,weather_type,'OPEN / LIVE' status,last_price,volume,open_interest,close_time FROM kalshi_weather_markets m WHERE status IN ('open','active') AND {kalshi_daily_sql()} ORDER BY volume DESC")
+    kalshi_markets=daily_weather_filter(kalshi_markets,focus,["title","subtitle"])
     st.dataframe(kalshi_markets.rename(columns={"ticker":"Ticker","title":"Market","subtitle":"Contract","weather_type":"Weather type","status":"Status","last_price":"Last price","volume":"Contracts traded","open_interest":"Open interest","close_time":"Close time"}),width="stretch",hide_index=True)
     st.subheader("Kalshi market activity review events")
     st.caption("Related trades in the same contract are grouped until there is a 30-minute break. This prevents a single burst from appearing as many separate alerts.")
-    kalshi_activity=df("""SELECT t.*,m.title,m.subtitle,m.event_ticker,m.weather_type,m.close_time
+    kalshi_activity=df(f"""SELECT t.*,m.title,m.subtitle,m.event_ticker,m.weather_type,m.close_time
         FROM kalshi_weather_trades t JOIN kalshi_weather_markets m USING(ticker)
-        WHERE m.status IN ('open','active') AND t.ticker IN (
+        WHERE m.status IN ('open','active') AND {kalshi_daily_sql()} AND t.ticker IN (
             SELECT DISTINCT t2.ticker FROM kalshi_weather_trades t2 JOIN kalshi_weather_markets m2 USING(ticker)
-            WHERE t2.is_anomaly AND m2.status IN ('open','active'))
+            WHERE t2.is_anomaly AND m2.status IN ('open','active') AND {kalshi_daily_sql('m2')})
         ORDER BY t.ticker,t.timestamp_utc""")
+    kalshi_activity=daily_weather_filter(kalshi_activity,focus,["title","subtitle"])
     activity_events=build_activity_events(kalshi_activity)
     if activity_events.empty: st.info("No Kalshi market-activity events currently meet the review rule.")
     else:
@@ -360,24 +484,52 @@ elif page=="Kalshi":
             selected=st.selectbox("Review event",visible_events.activity_event_id.tolist(),format_func=lambda event_id: (lambda r:f"{r.evidence_grade} · {r.case_type} · ${r.total_notional:,.0f} · {r.title}")(visible_events[visible_events.activity_event_id==event_id].iloc[0]))
             event=visible_events[visible_events.activity_event_id==selected].iloc[0]
             st.markdown(f"### {event.title}"); st.caption(f"{event.subtitle or ''} · {event.ticker} · {event.start_time} → {event.end_time}")
-            st.info(f"**What happened:** {event.summary} This is classified as **{event.case_type.lower()}** with **{event.evidence_grade.lower()} evidence** for research review.")
-            k1,k2,k3,k4=st.columns(4); k1.metric("Event traded value",f"${event.total_notional:,.2f}"); k2.metric("Trades in event",f"{int(event.trade_count):,}"); k3.metric("Observed price impact",f"{event.price_impact:+.3f}"); k4.metric("Review score",f"{event.review_score:.3f}")
+            st.info(f"**Why this trade event was flagged:** {event.summary} It is classified as **{event.case_type.lower()}** with **{event.evidence_grade.lower()} evidence** for research review.")
+            k1,k2,k3,k4=st.columns(4); k1.metric("Event traded value",f"${event.total_notional:,.2f}"); k2.metric("Largest trade",f"${event.largest_trade:,.2f}"); k3.metric("First trade time",str(event.start_time)); k4.metric("Review score",f"{event.review_score:.3f}")
             progression=kalshi_activity[kalshi_activity.ticker==event.ticker].copy(); progression["timestamp_utc"]=pd.to_datetime(progression.timestamp_utc,utc=True); progression["Cumulative traded dollars"]=progression.notional.cumsum()
             in_event=(progression.timestamp_utc>=event.start_time)&(progression.timestamp_utc<=event.end_time)
-            fig=go.Figure(); fig.add_trace(go.Bar(x=progression.timestamp_utc,y=progression.notional,name="Trade dollars",marker_color=["#dc2626" if x else "#8aa4c5" for x in in_event],hovertemplate="%{x}<br>Trade: $%{y:,.2f}<extra></extra>")); fig.add_trace(go.Scatter(x=progression.timestamp_utc,y=progression.price,name="Executed price",yaxis="y2",mode="lines+markers",line=dict(color="#111827",width=2),hovertemplate="%{x}<br>Price: %{y:.3f}<extra></extra>")); fig.add_vrect(x0=event.start_time,x1=event.end_time,fillcolor="#fca5a5",opacity=.16,line_width=1,line_color="#dc2626")
-            fig.update_layout(title="Trade value and executed-price progression",xaxis_title="Time",yaxis_title="Individual trade value ($)",yaxis2=dict(title="Executed price",overlaying="y",side="right",range=[0,1]),paper_bgcolor="#fff",plot_bgcolor="#fff",font=dict(color="#000"),legend=dict(font=dict(color="#000")),hovermode="x unified")
-            st.plotly_chart(chart_theme(fig),width="stretch")
-            st.caption("The red shaded window is the grouped review event. Red bars are trades inside it; the black line is the public executed price. Price movement is evidence about market activity, not trader identity or intent.")
             event_trades=progression[in_event].copy(); event_trades["Calculation"]=event_trades.apply(lambda r:f"${r.price:.3f} × {r.contracts:,.0f} = ${r.notional:,.2f}",axis=1)
+            event_share=float(event_trades.notional.sum()/progression.notional.sum()) if progression.notional.sum() else None
+            side_value=event_trades.groupby(event_trades.outcome_side.fillna("Unknown")).notional.sum().sort_values(ascending=False)
+            dominant_side=str(side_value.index[0]) if len(side_value) else "Unknown"; dominant_pct=float(side_value.iloc[0]/side_value.sum()) if side_value.sum() else 0
+            market_meta=df("SELECT open_interest FROM kalshi_weather_markets WHERE ticker=?",[event.ticker])
+            open_interest=float(market_meta.open_interest.iloc[0]) if len(market_meta) and pd.notna(market_meta.open_interest.iloc[0]) else None
+            event_contracts=float(event_trades.contracts.fillna(0).sum())
+            oi_participation=event_contracts/open_interest if open_interest and open_interest>0 else None
+            kalshi_label,kalshi_explanation=influence_description(event_share)
+            st.subheader("Market influence and position")
+            im1,im2,im3,im4=st.columns(4); im1.metric("Event share of observed trade value",f"{event_share:.1%}" if event_share is not None else "Unavailable",kalshi_label); im2.metric("Position lean",f"{dominant_side} ({dominant_pct:.1%})"); im3.metric("Event fills",f"{len(event_trades):,} of {len(progression):,}"); im4.metric("Contracts / open interest",f"{oi_participation:.1%}" if oi_participation is not None else "Unavailable")
+            st.info(f"**{kalshi_label}.** {kalshi_explanation} Kalshi's public feed does not identify users, so this measures whether the trade event dominated activity—not whether one person controlled the contract.")
+            st.warning("Kalshi ownership percentage cannot be calculated from its public trade feed because participant IDs are hidden. ‘Contracts / open interest’ is a market-pressure ratio: it compares contracts traded in this event with outstanding open interest. It is not an ownership percentage and can exceed 100% when contracts change hands repeatedly.")
+            st.markdown("**How to read the graph:** The top panel shows the executed price (0.70 = 70¢). The shaded area is the flagged event. The bottom panel shows each trade's dollar value; red bars are inside the flagged event and gray bars provide market context.")
+            fig=make_subplots(rows=2,cols=1,shared_xaxes=True,vertical_spacing=.12,row_heights=[.6,.4],subplot_titles=("Executed market price over time (0–1)","Individual trade values"))
+            fig.add_trace(go.Scatter(x=progression.timestamp_utc,y=progression.price,name="Executed price",mode="lines+markers",line=dict(color="#111827",width=2),marker=dict(color=["#dc2626" if x else "#64748b" for x in in_event],size=7),hovertemplate="Price %{y:.3f}<extra></extra>"),row=1,col=1)
+            fig.add_trace(go.Bar(x=progression.timestamp_utc,y=progression.notional,name="Trade value",marker_color=["#dc2626" if x else "#94a3b8" for x in in_event],customdata=progression[["price","contracts","outcome_side"]],hovertemplate="$%{y:,.2f}<br>Price %{customdata[0]:.3f} × %{customdata[1]:,.0f} contracts<br>%{customdata[2]}<extra></extra>"),row=2,col=1)
+            fig.add_vrect(x0=event.start_time,x1=event.end_time,fillcolor="#fca5a5",opacity=.18,line_width=1,line_color="#dc2626",row="all",col=1)
+            fig.update_yaxes(title_text="Price",range=[0,1],row=1,col=1); fig.update_yaxes(title_text="Trade value ($)",row=2,col=1); fig.update_xaxes(title_text="Trade time",row=2,col=1)
+            st.plotly_chart(readable_subplots(fig,"Flagged Kalshi event in market context"),width="stretch")
+            st.caption("The chart shows what happened in the market before, during, and after the flagged window. It does not reveal trader identity or intent.")
             st.dataframe(event_trades.rename(columns={"timestamp_utc":"Time","outcome_side":"Side","price":"Price","contracts":"Contracts","notional":"Trade value ($)","is_anomaly":"Flagged by rule"})[["Time","Side","Price","Contracts","Trade value ($)","Calculation","Flagged by rule"]],width="stretch",hide_index=True)
 
             st.subheader("Why it entered the research queue")
             calc=pd.DataFrame({"Signal":["K1 · Materiality","K2 · Unexplained timing","K3 · Price impact / reversal","K4 · Market pressure","K5 · Peer-market deviation"],"What it measures":["Size compared with similar public trades","Unusual arrival burst and proximity to close","Executed-price jump and subsequent reversal","Share of observed contract trading","Difference from comparable weather-market activity"],"Event score":[event.k1,event.k2,event.k3,event.k4,event.k5],"Reliability":[1.0,.4,.8,1.0,1.0]})
             st.dataframe(calc,width="stretch",hide_index=True)
+            strong_reasons=[]
+            for label,value in zip(calc.Signal,calc["Event score"]):
+                if float(value)>=.80:strong_reasons.append(f"{label} was high ({float(value):.2f})")
+            if strong_reasons:
+                st.markdown("**Specific reasons to inspect this event**")
+                for reason in strong_reasons:st.write(f"• {reason}")
+            st.markdown("**What to look at next**")
+            st.write("• Compare the largest trade with the other bars in the graph.  ")
+            st.write("• Check the traded side, price, contracts, and exact time in the trade table.  ")
+            st.write("• Look for a price continuation or reversal after the red event window.  ")
+            st.write("• Confirm whether a trusted weather update occurred near the event time.")
             st.write(f"The event has **{int(event.strong_dimensions)} strong dimensions out of 5**. Observed price: `{event.price_before:.3f}` before → `{event.price_end:.3f}` at event end → `{event.price_after:.3f}` next; maximum within-event swing: `{event.max_price_swing:.3f}`.")
             st.caption("Research-queue rule: score ≥ 0.95, materiality ≥ 0.85, at least three dimensions ≥ 0.80, and trade value ≥ $250. The evidence grade adds event-level context; neither is a probability of fraud.")
 
             st.subheader("Public-information and cross-market context")
+            show_weather_context(f"{event.title} {event.subtitle or ''}",event.start_time,"kalshi_weather_context")
             source=df("SELECT name,url,purpose FROM authoritative_weather_sources WHERE source_key=?",[event.weather_type])
             st.warning("No verified NOAA/NWS release timestamp is currently linked to this Kalshi contract. Timing evidence is therefore down-weighted and should not be interpreted as proof of pre-announcement trading.")
             if not source.empty: st.dataframe(source.rename(columns={"name":"Independent weather source","url":"URL","purpose":"Use"}),width="stretch",hide_index=True)
@@ -389,7 +541,7 @@ elif page=="Kalshi":
             else: st.write("**Polymarket comparison:** No sufficiently similar open contract was found. The dashboard does not force an unreliable cross-platform match.")
 
             st.subheader("Contract-family diagnostic")
-            siblings=df("SELECT ticker,subtitle,last_price,volume,open_interest FROM kalshi_weather_markets WHERE event_ticker=? AND status IN ('open','active') ORDER BY ticker",[event.event_ticker]) if pd.notna(event.event_ticker) else pd.DataFrame()
+            siblings=df(f"SELECT ticker,subtitle,last_price,volume,open_interest FROM kalshi_weather_markets m WHERE event_ticker=? AND status IN ('open','active') AND {kalshi_daily_sql()} ORDER BY ticker",[event.event_ticker]) if pd.notna(event.event_ticker) else pd.DataFrame()
             if siblings.empty: st.info("No open sibling contracts were found for this event family.")
             else:
                 f1,f2=st.columns(2); f1.metric("Open contracts in family",len(siblings)); f2.metric("Sum of last prices",f"{siblings.last_price.fillna(0).sum():.3f}")
@@ -432,6 +584,12 @@ elif page=="Case Detail":
                 rid=hashlib.sha256(f"{aid}|{reviewer}|{datetime.now(timezone.utc)}".encode()).hexdigest(); con.execute("INSERT INTO reviews VALUES (?,?,?,?,?,?,?,?,?)",[rid,aid,reviewer,datetime.now(timezone.utc),disposition,notes,disposition=="ESCALATE",None,None]); con.execute("UPDATE alerts SET status=? WHERE alert_id=?",[disposition,aid]); st.success("Review saved")
 elif page=="Events":
     st.subheader("Public-event timestamp management"); st.dataframe(df("SELECT market_id,event_time_utc original_timestamp,event_time_utc verified_timestamp,headline AS event_source,source_url,annotator,verification_time,confidence,verified,rejected FROM public_events ORDER BY event_time_utc DESC"),width="stretch")
+    st.subheader("Live weather context feed")
+    st.caption("NWS alerts are official evidence. GDELT-indexed news is supporting context with lower reliability.")
+    try:context_feed=df("SELECT source_type AS Type,source_name AS Source,title AS Headline,published_at AS Published,weather_type AS Topic,reliability AS Reliability,url AS Link FROM weather_news_items ORDER BY published_at DESC LIMIT 100")
+    except duckdb.CatalogException:context_feed=pd.DataFrame()
+    if context_feed.empty:st.info("No weather context has been loaded yet. Run `ingest-weather-context` from Settings / Data or the command line.")
+    else:st.dataframe(context_feed,width="stretch",hide_index=True,column_config={"Link":st.column_config.LinkColumn(),"Reliability":st.column_config.NumberColumn(format="%.2f")})
     markets=df(f"SELECT market_id,question FROM markets m WHERE m.status='open' AND {weather_sql()} ORDER BY question");
     if len(markets):
         with st.form("event"):
@@ -469,4 +627,5 @@ elif page=="Health":
     st.dataframe(pd.DataFrame(sensitivity),width="stretch",hide_index=True, column_config={"Flag rate":st.column_config.NumberColumn(format="%.2%%")})
     st.caption("These are rule-volume sensitivity results, not false-positive rates. A false-positive rate requires independently labeled review outcomes.")
 else:
-    st.subheader("Settings / Data"); st.json({"Data API base URL":s.data_api_base_url,"Gamma API base URL":s.gamma_base_url,"CLOB base URL":s.clob_base_url,"HTTP timeout":s.request_timeout_seconds,"Request concurrency":s.concurrency,"Rate-limit delay":"exponential jitter","Market limit":"CLI --markets","Trade limit":s.trade_limit,"Price-history resolution":s.price_bucket_seconds})
+    st.subheader("Settings / Data"); st.json({"Data API base URL":s.data_api_base_url,"Gamma API base URL":s.gamma_base_url,"CLOB base URL":s.clob_base_url,"NWS official weather API":s.nws_base_url,"GDELT weather news API":s.gdelt_base_url,"HTTP timeout":s.request_timeout_seconds,"Request concurrency":s.concurrency,"Rate-limit delay":"exponential jitter","Market limit":"CLI --markets","Trade limit":s.trade_limit,"Price-history resolution":s.price_bucket_seconds})
+    st.info("Weather context refresh command: `python -m app.cli.main ingest-weather-context --articles 100`. Official NWS alerts receive reliability 1.00. News articles receive reliability 0.45 and are supporting context only.")
