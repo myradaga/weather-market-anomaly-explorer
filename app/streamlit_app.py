@@ -229,7 +229,7 @@ def render_polymarket_analysis():
     if choices.empty: st.info("No scored Polymarket weather episodes are available yet."); return
     labels={r.alert_id:f"{r.composite_score:.3f} · {r.question} · {str(r.wallet)[:12]}…" for _,r in choices.iterrows()}
     aid=st.selectbox("Choose a flagged Polymarket wallet episode",choices.alert_id.tolist(),format_func=labels.get,key="poly_case")
-    case=df("""SELECT a.*,e.*,m.question,m.slug,m.resolved_token,m.resolution_time,f.* FROM alerts a JOIN episodes e USING(episode_id)
+    case=df("""SELECT a.*,e.*,m.question,m.slug,m.resolved_token,m.resolution_time,m.close_time,f.* FROM alerts a JOIN episodes e USING(episode_id)
         JOIN markets m USING(market_id) JOIN episode_features f USING(episode_id) WHERE alert_id=?""",[aid]).iloc[0]
     p1,p2,p3,p4=st.columns(4); p1.metric("Anomaly score",f"{case.composite_score:.3f}"); p2.metric("Position",case.direction); p3.metric("Position value",f"${case.total_notional:,.2f}"); p4.metric("Trades",int(case.trade_count))
     st.markdown(f"**{case.question}**  \nWallet: `{case.wallet}`")
@@ -245,6 +245,15 @@ def render_polymarket_analysis():
     fills=df("""SELECT timestamp_utc,price,side,outcome,size,notional,signed_exposure FROM fills WHERE market_id=? AND wallet=?
         AND timestamp_utc BETWEEN ? AND ? ORDER BY timestamp_utc""",[case.market_id,case.wallet,case.entry_time,case.exit_time])
     fills["cumulative_notional"]=fills.notional.cumsum()
+    fills["cumulative_position"]=fills.signed_exposure.fillna(0).cumsum()
+    close_time=pd.to_datetime(case.close_time,utc=True) if pd.notna(case.close_time) else pd.NaT
+    fills["hours_before_close"]=(close_time-pd.to_datetime(fills.timestamp_utc,utc=True)).dt.total_seconds()/3600 if pd.notna(close_time) else np.nan
+    late_fills=fills[(fills.hours_before_close>=0)&(fills.hours_before_close<=24)].copy()
+    late_value=float(late_fills.notional.sum()) if len(late_fills) else 0.0
+    late_change=float(late_fills.signed_exposure.fillna(0).sum()) if len(late_fills) else 0.0
+    if pd.notna(close_time):
+        lr1,lr2,lr3=st.columns(3); lr1.metric("Closest change before close",f"{fills["hours_before_close"].where(fills.hours_before_close>=0).min():.1f} hours" if (fills.hours_before_close>=0).any() else "None captured"); lr2.metric("Value traded in final 24h",f"${late_value:,.2f}"); lr3.metric("Net position change in final 24h",f"${late_change:,.2f}")
+        if len(late_fills):st.warning("**Pre-resolution activity indicator:** this wallet changed its captured position during the final 24 hours before the market closed. Larger and more directional changes receive stronger timing evidence; late timing alone does not imply misconduct.")
     market_prices=df("SELECT timestamp_utc,price FROM fills WHERE market_id=? ORDER BY timestamp_utc",[case.market_id])
     totals=df("""SELECT count(*) market_fills,sum(notional) market_value,
         sum(CASE WHEN wallet=? THEN 1 ELSE 0 END) wallet_fills,
@@ -276,8 +285,13 @@ def render_polymarket_analysis():
         subset=fills[fills.outcome.astype(str).str.upper()==outcome]
         if len(subset):fig.add_trace(go.Scatter(x=subset.timestamp_utc,y=subset.price,name=f"Wallet {outcome} fills",mode="markers",marker=dict(color=color,size=10,line=dict(color="#ffffff",width=1)),customdata=subset[["side","size","notional"]],hovertemplate=f"{outcome} · %{{customdata[0]}}<br>Price %{{y:.3f}}<br>%{{customdata[1]:,.2f}} shares · $%{{customdata[2]:,.2f}}<extra></extra>"),row=1,col=1)
     fig.add_trace(go.Bar(x=fills.timestamp_utc,y=fills.notional,name="Wallet trade value",marker_color=["#2563eb" if str(x).upper()=="YES" else "#dc2626" for x in fills.outcome],customdata=fills[["price","size","side","outcome"]],hovertemplate="$%{y:,.2f}<br>Price %{customdata[0]:.3f} × %{customdata[1]:,.2f} shares<br>%{customdata[2]} %{customdata[3]}<extra></extra>"),row=2,col=1)
+    if pd.notna(close_time):fig.add_vline(x=close_time,line_dash="dash",line_color="#7c3aed",annotation_text="Market close / resolution window",annotation_font_color="#000000",row="all",col=1)
     fig.update_yaxes(title_text="Price",range=[0,1],row=1,col=1); fig.update_yaxes(title_text="Trade value ($)",row=2,col=1); fig.update_xaxes(title_text="Trade time",row=2,col=1)
     st.plotly_chart(readable_subplots(fig,"Wallet position, price, and trade progression"),width="stretch")
+    if len(late_fills):
+        st.markdown("**Position changes recorded during the final 24 hours**")
+        late_display=late_fills.copy(); late_display["Position change"]=late_display.signed_exposure; late_display["Position after trade"]=late_display.cumulative_position
+        st.dataframe(late_display.rename(columns={"timestamp_utc":"Time","hours_before_close":"Hours before close","side":"Action","outcome":"Outcome","notional":"Trade value ($)"})[["Time","Hours before close","Action","Outcome","Trade value ($)","Position change","Position after trade"]],width="stretch",hide_index=True)
     log=fills.copy(); log["Notional calculation"]=log.apply(lambda r:f"${r.price:.4f} × {r.size:,.2f} = ${r.notional:,.2f}",axis=1)
     st.dataframe(log.rename(columns={"timestamp_utc":"Time","side":"Action","outcome":"Outcome","price":"Price","size":"Shares","notional":"Trade value ($)","cumulative_notional":"Cumulative ($)"})[["Time","Action","Outcome","Price","Shares","Trade value ($)","Notional calculation","Cumulative ($)"]],width="stretch",hide_index=True)
     performance=horizon_performance(market_prices,case.entry_time,case.entry_price,case.direction)
@@ -286,7 +300,7 @@ def render_polymarket_analysis():
         performance.append({"Horizon":"Settlement","Observed price":settlement,"Signed move":round(settlement-float(case.entry_price),4),"Status":f"Resolved {case.resolved_token}"})
     st.subheader("What happened after entry?"); st.dataframe(pd.DataFrame(performance),width="stretch",hide_index=True)
     scores=[case.s1,case.s2,case.s3,case.s4,case.s5]; reliability=[case.q1,case.q2,case.q3,case.q4,case.q5]
-    logic=["Larger of market-size percentile and wallet-history percentile","Exponential closeness to verified weather observation: exp(-lead hours / 72)","Prior resolved performance: 0.5 + 0.5×tanh(2×mean ROI)","Average of absolute market imbalance and wallet market share","Isolation Forest behavioral-anomaly percentile"]
+    logic=["Larger of market-size percentile and wallet-history percentile","Stronger of verified-event timing and down-weighted pre-resolution position-change proximity","Prior resolved performance: 0.5 + 0.5×tanh(2×mean ROI)","Average of absolute market imbalance and wallet market share","Isolation Forest behavioral-anomaly percentile"]
     rows=[]
     for name,logic_text,value,q in zip(SIGNAL_HELP,logic,scores,reliability):
         available=pd.notna(value) and float(q)>0
@@ -526,6 +540,9 @@ elif page=="Kalshi Scanner":
             st.write("• Look for a price continuation or reversal after the red event window.  ")
             st.write("• Confirm whether a trusted weather update occurred near the event time.")
             st.write(f"The event has **{int(event.strong_dimensions)} strong dimensions out of 5**. Observed price: `{event.price_before:.3f}` before → `{event.price_end:.3f}` at event end → `{event.price_after:.3f}` next; maximum within-event swing: `{event.max_price_swing:.3f}`.")
+            if event.hours_to_close is not None and pd.notna(event.hours_to_close):
+                if 0<=float(event.hours_to_close)<=24:st.warning(f"**Pre-resolution activity indicator:** this trade event began {float(event.hours_to_close):.1f} hours before the contract closed. Its timing contributes to K2, but it must be evaluated with trade size, direction, price impact, and weather information.")
+                else:st.caption(f"Resolution timing: this event began {float(event.hours_to_close):.1f} hours before contract close.")
             st.caption("Research-queue rule: score ≥ 0.95, materiality ≥ 0.85, at least three dimensions ≥ 0.80, and trade value ≥ $250. The evidence grade adds event-level context; neither is a probability of fraud.")
 
             st.subheader("Public-information and cross-market context")
