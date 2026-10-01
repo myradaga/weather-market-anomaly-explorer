@@ -102,7 +102,7 @@ hr {border-color:var(--line)}
 </style>""",unsafe_allow_html=True)
 st.markdown("""<div class="hero"><h1>Weather Market Anomaly Explorer</h1><p>Compare live Polymarket wallet episodes with public Kalshi weather-market trade anomalies.</p></div>""",unsafe_allow_html=True)
 st.caption("Anomaly scores identify unusual patterns. They are not probabilities of illegal conduct and do not establish wrongdoing.")
-page=st.sidebar.radio("Navigate",["Dashboard","Polymarket Scanner","Kalshi Scanner","Events","Health","Settings / Data"])
+page=st.sidebar.radio("Navigate",["Dashboard","Polymarket Scanner","Kalshi Scanner","Resolved Outcomes","Events","Health","Settings / Data"])
 
 def df(sql,params=None):
     with connect(read_only=True) as con:return con.execute(sql,params or []).fetchdf()
@@ -568,6 +568,64 @@ elif page=="Kalshi Scanner":
             with st.expander("Evidence that is unavailable from Kalshi's public feed"):
                 st.dataframe(pd.DataFrame({"Unavailable evidence":["Trader identity","Account-level history","Counterparty links","Order submissions and cancellations","Wash-trading test","Spoofing or layering test"],"Consequence":["Cannot identify a person or account","Cannot assess repeat success by user","Cannot detect coordinated accounts","Cannot observe intent from unexecuted orders","Cannot attribute both sides to one user","Cannot infer deceptive order-book behavior"]}),width="stretch",hide_index=True)
                 st.warning("The Kalshi section identifies unusual market activity only. It cannot identify the user responsible or conclude that fraud occurred.")
+elif page=="Resolved Outcomes":
+    st.subheader("Resolved Polymarket Wallet Outcomes")
+    st.caption("Review whether a pseudonymous wallet's final captured position matched the official market result after it changed exposure during the final 24 hours before resolution.")
+    st.info("A win means the wallet's final direction in the trades captured by this dashboard matched the market's published YES/NO result. It does not prove profit, intent, or wrongdoing.")
+    resolved=df(f"""WITH wallet_outcomes AS (
+        SELECT m.market_id,m.question,m.slug,m.resolved_token,m.close_time,m.resolution_time,
+          f.wallet,count(*) fill_count,sum(f.notional) total_traded,
+          sum(f.signed_exposure) final_net_exposure,
+          sum(CASE WHEN f.timestamp_utc BETWEEN coalesce(m.resolution_time,m.close_time)-INTERVAL 24 HOUR
+                       AND coalesce(m.resolution_time,m.close_time) THEN f.signed_exposure ELSE 0 END) late_position_change,
+          sum(CASE WHEN f.timestamp_utc BETWEEN coalesce(m.resolution_time,m.close_time)-INTERVAL 24 HOUR
+                       AND coalesce(m.resolution_time,m.close_time) THEN f.notional ELSE 0 END) late_traded_value,
+          sum(CASE WHEN f.timestamp_utc BETWEEN coalesce(m.resolution_time,m.close_time)-INTERVAL 24 HOUR
+                       AND coalesce(m.resolution_time,m.close_time) THEN 1 ELSE 0 END) late_fill_count,
+          min(CASE WHEN f.timestamp_utc<=coalesce(m.resolution_time,m.close_time)
+                   THEN date_diff('second',f.timestamp_utc,coalesce(m.resolution_time,m.close_time))/3600.0 END) closest_hours
+        FROM fills f JOIN markets m USING(market_id)
+        WHERE m.status='resolved' AND m.resolved_token IN ('YES','NO') AND {weather_sql()}
+        GROUP BY m.market_id,m.question,m.slug,m.resolved_token,m.close_time,m.resolution_time,f.wallet)
+      SELECT *,CASE WHEN final_net_exposure>0 THEN 'YES' WHEN final_net_exposure<0 THEN 'NO' ELSE 'FLAT' END final_position,
+        CASE WHEN final_net_exposure=0 THEN 'FLAT'
+             WHEN (final_net_exposure>0 AND resolved_token='YES') OR (final_net_exposure<0 AND resolved_token='NO') THEN 'WON'
+             ELSE 'LOST' END outcome
+      FROM wallet_outcomes WHERE late_fill_count>0 AND abs(late_position_change)>0
+      ORDER BY resolution_time DESC,late_traded_value DESC""")
+    if resolved.empty:st.info("No resolved daily rain or temperature wallets with final-24-hour position changes are available yet.")
+    else:
+        r1,r2,r3,r4=st.columns(4); r1.metric("Resolved wallet cases",f"{len(resolved):,}"); r2.metric("Markets",f"{resolved.market_id.nunique():,}"); r3.metric("Won",f"{(resolved.outcome=='WON').sum():,}"); r4.metric("Lost",f"{(resolved.outcome=='LOST').sum():,}")
+        f1,f2,f3=st.columns(3); result_filter=f1.multiselect("Outcome",["WON","LOST","FLAT"],default=["WON","LOST"]); min_late=f2.number_input("Minimum final-24h traded value ($)",min_value=0.0,value=0.0,step=100.0); only_flip=f3.checkbox("Only direction reversals",value=False,help="Show wallets whose captured direction before the final 24 hours differs from their final direction.")
+        resolved["pre_window_exposure"]=resolved.final_net_exposure-resolved.late_position_change
+        resolved["pre_window_position"]=np.where(resolved.pre_window_exposure>0,"YES",np.where(resolved.pre_window_exposure<0,"NO","FLAT"))
+        resolved["direction_changed"]=resolved.pre_window_position!=resolved.final_position
+        visible=resolved[resolved.outcome.isin(result_filter)&(resolved.late_traded_value>=min_late)]
+        if only_flip:visible=visible[visible.direction_changed]
+        st.markdown("### Wallet result table")
+        summary=visible.rename(columns={"question":"Market","wallet":"Wallet","resolved_token":"Market result","pre_window_position":"Position before final 24h","final_position":"Final captured position","outcome":"Wallet outcome","late_position_change":"Final-24h position change ($)","late_traded_value":"Final-24h traded value ($)","late_fill_count":"Final-24h fills","closest_hours":"Closest trade before resolution (hours)","direction_changed":"Direction changed"})
+        st.dataframe(summary[["Market","Wallet","Market result","Position before final 24h","Final captured position","Direction changed","Wallet outcome","Final-24h position change ($)","Final-24h traded value ($)","Final-24h fills","Closest trade before resolution (hours)"]],width="stretch",hide_index=True,column_config={"Final-24h position change ($)":st.column_config.NumberColumn(format="$%.2f"),"Final-24h traded value ($)":st.column_config.NumberColumn(format="$%.2f"),"Closest trade before resolution (hours)":st.column_config.NumberColumn(format="%.1f")})
+        if visible.empty:st.info("No resolved wallet cases match these filters.")
+        else:
+            case_ids=list(visible.index); selected_idx=st.selectbox("Inspect a resolved wallet case",case_ids,format_func=lambda i:f"{visible.loc[i,'outcome']} · {visible.loc[i,'final_position']} vs result {visible.loc[i,'resolved_token']} · {visible.loc[i,'question']} · {str(visible.loc[i,'wallet'])[:12]}…")
+            selected=visible.loc[selected_idx]; resolution=pd.to_datetime(selected.resolution_time if pd.notna(selected.resolution_time) else selected.close_time,utc=True)
+            st.markdown(f"### {selected.question}"); st.code(selected.wallet)
+            o1,o2,o3,o4=st.columns(4); o1.metric("Official result",selected.resolved_token); o2.metric("Final captured position",selected.final_position); o3.metric("Outcome",selected.outcome); o4.metric("Final-24h change",f"${selected.late_position_change:,.2f}")
+            detail=df("""SELECT timestamp_utc,side,outcome,price,size,notional,signed_exposure
+                FROM fills WHERE market_id=? AND wallet=? AND timestamp_utc<=? ORDER BY timestamp_utc""",[selected.market_id,selected.wallet,resolution])
+            detail["Captured position"]=detail.signed_exposure.fillna(0).cumsum(); detail["Hours before resolution"]=(resolution-pd.to_datetime(detail.timestamp_utc,utc=True)).dt.total_seconds()/3600; detail["Final 24 hours"]=detail["Hours before resolution"].between(0,24)
+            fig=make_subplots(rows=2,cols=1,shared_xaxes=True,vertical_spacing=.12,row_heights=[.6,.4],subplot_titles=("Captured wallet position over time","Individual trade values"))
+            fig.add_trace(go.Scatter(x=detail.timestamp_utc,y=detail["Captured position"],name="Captured net position",mode="lines+markers",line=dict(color="#111827",width=3),marker=dict(color=["#dc2626" if x else "#2563eb" for x in detail["Final 24 hours"]]),hovertemplate="Position $%{y:,.2f}<extra></extra>"),row=1,col=1)
+            fig.add_hline(y=0,line_color="#64748b",line_dash="dot",row=1,col=1)
+            fig.add_trace(go.Bar(x=detail.timestamp_utc,y=detail.notional,name="Trade value",marker_color=["#dc2626" if x else "#94a3b8" for x in detail["Final 24 hours"]],customdata=detail[["side","outcome","price","size"]],hovertemplate="$%{y:,.2f}<br>%{customdata[0]} %{customdata[1]} at %{customdata[2]:.3f}<br>%{customdata[3]:,.2f} shares<extra></extra>"),row=2,col=1)
+            fig.add_vrect(x0=resolution-pd.Timedelta(hours=24),x1=resolution,fillcolor="#fca5a5",opacity=.16,line_width=0,row="all",col=1); fig.add_vline(x=resolution,line_dash="dash",line_color="#7c3aed",annotation_text=f"Resolved {selected.resolved_token}",annotation_font_color="#000000",row="all",col=1)
+            fig.update_yaxes(title_text="Net exposure ($)",row=1,col=1); fig.update_yaxes(title_text="Trade value ($)",row=2,col=1); fig.update_xaxes(title_text="Time",row=2,col=1)
+            st.plotly_chart(readable_subplots(fig,"Position changes before the official result"),width="stretch")
+            st.caption("Red points and bars are in the final 24-hour window. Above zero indicates captured YES exposure; below zero indicates captured NO exposure. The dashed purple line is the recorded resolution time.")
+            late_detail=detail[detail["Final 24 hours"]].copy(); late_detail["Calculation"]=late_detail.apply(lambda r:f"${r.price:.3f} × {r.size:,.2f} = ${r.notional:,.2f}",axis=1)
+            st.dataframe(late_detail.rename(columns={"timestamp_utc":"Time","side":"Action","outcome":"Contract","price":"Price","size":"Shares","notional":"Trade value ($)","signed_exposure":"Position change ($)"})[["Time","Hours before resolution","Action","Contract","Price","Shares","Trade value ($)","Calculation","Position change ($)","Captured position"]],width="stretch",hide_index=True)
+            if selected.slug:st.link_button("Open original Polymarket market",f"https://polymarket.com/event/{selected.slug}")
+            st.warning("Captured position is reconstructed from available public fills and is not a verified account statement. A wallet can win a market while losing money overall, and a late winning change is not evidence that the wallet possessed private information.")
 elif page=="Case Detail":
     choices=df(f"SELECT a.alert_id,round(a.composite_score,3) score,m.question,e.wallet FROM alerts a JOIN episodes e USING(episode_id) JOIN markets m USING(market_id) WHERE m.status='open' AND {weather_sql()} ORDER BY score DESC")
     if choices.empty: st.info("No cases available.")
